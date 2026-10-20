@@ -1,0 +1,254 @@
+name: CI Build for Main Branch & PRs
+
+on:
+  push:
+    branches:
+      - main
+      - master  # Adjust if your default branch has a different name
+    tags:
+      - 'v*' # Trigger on version tags like v1.0.0, v0.1.0-beta, etc.
+  pull_request:
+    branches:
+      - main
+      - master  # Adjust if your default branch has a different name
+
+jobs:
+  build_tauri_desktop_ci:
+    name: Build Tauri Desktop Apps (CI)
+    strategy:
+      fail-fast: false
+      matrix:
+        platform: [macos-latest, ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.platform }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '18' # Using Node.js 18, adjust if needed
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable # Using stable Rust
+
+      - name: Install Linux dependencies (GTK, WebKit, AppIndicator, rsvg)
+        if: matrix.platform == 'ubuntu-latest'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libgtk-3-dev libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf
+
+      - name: Install frontend dependencies
+        run: npm install # Using npm as per your package.json
+
+      # Optional: Add steps for linting or running tests if you have them
+      # - name: Run Linter
+      #   run: npm run lint # Replace with your lint script
+      # - name: Run Tests
+      #   run: npm run test # Replace with your test script
+
+      - name: Build Tauri application (unsigned)
+        # Uses 'npx tauri build' which should pick up the devDependency
+        run: npx tauri build
+
+      - name: Compress .app bundle for macOS
+        if: matrix.platform == 'macos-latest' && success()
+        run: |
+          APP_NAME=$(basename src-tauri/target/release/bundle/macos/*.app .app)
+          tar -czf "src-tauri/target/release/bundle/macos/${APP_NAME}.app.tar.gz" -C src-tauri/target/release/bundle/macos/ "${APP_NAME}.app"
+          ls -lh src-tauri/target/release/bundle/macos/
+
+      - name: Upload Desktop Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: LibreTV-App-${{ matrix.platform }} # Simplified name for easier download later
+          path: |
+            src-tauri/target/release/bundle/dmg/*.dmg
+            src-tauri/target/release/bundle/macos/*.app.tar.gz
+            src-tauri/target/release/bundle/appimage/*.AppImage
+            src-tauri/target/release/bundle/deb/*.deb
+            src-tauri/target/release/bundle/msi/*.msi
+            src-tauri/target/release/bundle/nsis/*.exe # Corrected path for NSIS
+          if-no-files-found: ignore 
+
+  build_tauri_android_ci:
+    name: Build Tauri Android App (CI)
+    runs-on: ubuntu-22.04 # Changed from ubuntu-latest to ubuntu-22.04
+    env:
+      # If you want signed CI builds, uncomment and ensure secrets are available.
+      # Otherwise, unsigned builds will be produced.
+      # TAURI_ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+      # TAURI_ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+      # TAURI_ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+      # TAURI_ANDROID_KEYSTORE_PATH will be set dynamically if keystore secret is present
+      NODE_OPTIONS: --max-old-space-size=8192 # Increase Node.js memory limit if needed for large projects
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '18'
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+
+      - name: Setup Java JDK
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17' # JDK 17 is often recommended for modern Android development
+
+      - name: Setup Android SDK and NDK
+        uses: android-actions/setup-android@v3
+        with:
+          # sdk-version is deprecated, use packages. build-tools is also part of packages.
+          # ndk-version is an unexpected input, specify NDK via packages.
+          # For platform-tools, sdkmanager usually fetches the latest if no version is specified.
+          # For cmdline-tools, 'latest' specifier seems to be common.
+          packages: "platform-tools platforms;android-34 build-tools;34.0.0 cmdline-tools;latest ndk;25.2.9519653"
+
+      - name: Verify Android Environment Variables
+        run: |
+          echo "ANDROID_HOME: $ANDROID_HOME"
+          echo "NDK_HOME: $NDK_HOME"
+          if [ -z "$NDK_HOME" ]; then
+            echo "Error: NDK_HOME is not set."
+            # Attempt to find NDK path if not set, common location with setup-android
+            POSSIBLE_NDK_HOME="$ANDROID_HOME/ndk-bundle" # Common default
+            ALTERNATIVE_NDK_HOME_PATTERN="$ANDROID_HOME/ndk/*" # setup-android might install it in a versioned subfolder
+            
+            echo "Looking for NDK in $ANDROID_HOME/ndk/..."
+            ls -d $ANDROID_HOME/ndk/*/ | head -n 1
+            
+            FOUND_NDK_PATH=$(ls -d $ANDROID_HOME/ndk/*/ | head -n 1)
+            if [ -d "$FOUND_NDK_PATH" ]; then
+              echo "Found NDK at $FOUND_NDK_PATH. Setting NDK_HOME."
+              echo "NDK_HOME=$FOUND_NDK_PATH" >> $GITHUB_ENV
+              export NDK_HOME=$FOUND_NDK_PATH # Export for current step
+              echo "Updated NDK_HOME: $NDK_HOME"
+            elif [ -d "$POSSIBLE_NDK_HOME" ]; then
+              echo "Found NDK at $POSSIBLE_NDK_HOME. Setting NDK_HOME."
+              echo "NDK_HOME=$POSSIBLE_NDK_HOME" >> $GITHUB_ENV
+              export NDK_HOME=$POSSIBLE_NDK_HOME # Export for current step
+              echo "Updated NDK_HOME: $NDK_HOME"
+            else
+              echo "NDK not found in common locations."
+              # exit 1 # Optionally fail the build here
+            fi
+          fi
+          # Also ensure NDK path is added to PATH for tools like ndk-build if needed by tauri internally
+          if [ -n "$NDK_HOME" ] && [ -d "$NDK_HOME" ]; then
+            echo "Adding NDK_HOME to PATH: $NDK_HOME"
+            echo "$NDK_HOME" >> $GITHUB_PATH
+          fi
+
+      # Android build dependencies (Java, SDK, NDK) are often handled by Tauri's build scripts or need to be set up.
+      # For a more robust setup, consider actions/setup-java and potentially android-actions/setup-android.
+      # However, Tauri's internal setup might suffice for basic builds.
+
+      - name: Install frontend dependencies
+        run: |
+          npm install
+          echo "Ensuring @tauri-apps/api is installed..."
+          npm list @tauri-apps/api || npm install @tauri-apps/api --save-dev
+
+      - name: Display Tauri environment information
+        run: npx tauri info
+
+      - name: Clean and Ensure gen directory exists
+        run: |
+          echo "Attempting to remove existing src-tauri/gen directory if it exists..."
+          rm -rf src-tauri/gen || echo "Failed to remove src-tauri/gen, or it didn't exist. Continuing..."
+          echo "Creating src-tauri/gen directory..."
+          mkdir -p src-tauri/gen
+          echo "Listing permissions for src-tauri/gen:"
+          ls -ld src-tauri/gen
+          echo "Listing contents of src-tauri:"
+          ls -la src-tauri
+
+      - name: Initialize Tauri Android project
+        run: npx tauri android init -v # Generate Android project files with verbose logging
+
+      - name: Check for Android project directory and src-tauri contents
+        run: |
+          echo "--- Checking src-tauri/gen directory ---"
+          ls -la src-tauri/gen || echo "src-tauri/gen directory not found or ls failed"
+          echo "--- Checking src-tauri/gen/android directory ---"
+          ls -la src-tauri/gen/android || echo "src-tauri/gen/android directory not found or ls failed"
+          echo "--- Full listing of src-tauri after init ---"
+          ls -Rla src-tauri || echo "Failed to list src-tauri recursively"
+
+      - name: Decode Android Keystore and Set Path (for signed CI builds)
+        run: |
+          if [ -n "${{ secrets.ANDROID_SIGNING_KEY_JKS_BASE64 }}" ] && \
+             ( [ -n "${{ secrets.ANDROID_KEYSTORE_PASSWORD }}" ] || \
+               [ -n "${{ env.TAURI_ANDROID_KEYSTORE_PASSWORD }}" ] ); then
+            echo "Condition met: Decoding Keystore for CI..."
+            echo "${{ secrets.ANDROID_SIGNING_KEY_JKS_BASE64 }}" | base64 --decode > release_keystore_ci.jks
+            echo "TAURI_ANDROID_KEYSTORE_PATH=${{ github.workspace }}/release_keystore_ci.jks" >> $GITHUB_ENV
+            echo "CI Keystore decoded and TAURI_ANDROID_KEYSTORE_PATH set."
+          else
+            echo "Condition not met: Skipping keystore decoding. Required secrets or env vars might not be set."
+          fi
+
+      - name: Build Tauri Android application (CI)
+        # This will produce an unsigned release APK/AAB by default if signing env vars are not fully set.
+        # If signing env vars are set (from secrets), it will attempt a signed build.
+        run: npx tauri android build
+
+      - name: Upload Android Artifacts (CI)
+        uses: actions/upload-artifact@v4
+        with:
+          name: LibreTV-App-Android # Simplified name
+          path: |
+            src-tauri/gen/android/app/build/outputs/apk/universal/release/*.apk
+            src-tauri/gen/android/app/build/outputs/bundle/universalRelease/*.aab
+          if-no-files-found: error
+
+  create_release:
+    name: Create GitHub Release
+    runs-on: ubuntu-latest
+    needs: [build_tauri_desktop_ci, build_tauri_android_ci]
+    if: startsWith(github.ref, 'refs/tags/') # Only run for tag pushes
+    permissions:
+      contents: write # Needed to create releases
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Download all build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts/ # All artifacts will be downloaded into subdirectories here (e.g., artifacts/LibreTV-App-macos-latest/)
+
+      - name: List downloaded artifacts for debugging
+        run: |
+          ls -R artifacts/
+          echo "GITHUB_REF_NAME: ${{ github.ref_name }}"
+          echo "GITHUB_SHA: ${{ github.sha }}"
+
+      - name: Create Release and Upload Assets
+        uses: softprops/action-gh-release@v2
+        with:
+          # The tag from github.ref (e.g., v1.0.0) will be used automatically for the release tag and name
+          # body_path: CHANGELOG.md # Optional: path to a file with release notes
+          # prerelease: ${{ contains(github.ref_name, '-beta') || contains(github.ref_name, '-alpha') }} # Optional: mark as pre-release if tag contains -beta or -alpha
+          files: |
+            artifacts/LibreTV-App-macos-latest/*.dmg
+            artifacts/LibreTV-App-macos-latest/*.app.tar.gz
+            artifacts/LibreTV-App-ubuntu-latest/*.AppImage
+            artifacts/LibreTV-App-ubuntu-latest/*.deb
+            artifacts/LibreTV-App-windows-latest/*.msi
+            artifacts/LibreTV-App-windows-latest/*.exe 
+            artifacts/LibreTV-App-Android/*.apk
+            artifacts/LibreTV-App-Android/*.aab
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
